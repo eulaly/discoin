@@ -559,6 +559,5 @@ if __name__ == "__main__":
     bot.add_cog(Scheduler(bot))
 
     # bot.run(getenv('api_token'))
-    discoin = 'OTA3ODA3NDY0NDQxOTA5Mjg5.YYsjlQ.BeiTfDwz_M0dBs9B0349VnZz5XM'
-    devot = 'OTEwNjk3MTMxNDU3Nzk4MTg1.YZWmzA.mZd0sWvK8ZUoMZM6Ez-yOgworpc'
+  
     bot.run('devbot')

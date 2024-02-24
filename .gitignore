@@ -1,5 +1,9 @@
 __pycache__/
 old versions/
 venv/
-secrets*
+assets/
+*secrets*
 *.org
+#*
+*#
+

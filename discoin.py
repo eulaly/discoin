@@ -26,35 +26,40 @@ def chunker(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
-def search_coins(keyword:str):
+def search_coins(keyword:str, check:bool=False):
     '''broad search of coingecko coin listings'''
-    # if the search term matches coingecko id already, return it:
     cgid = mongo_client.coingecko.distinct('id')
-    if keyword in cgid: 
+    if keyword in cgid:
+        # confirm the coin exists; replace dbck?
+        if check == True:
+            return True
+        # if the search term matches coingecko id already, return it:
         return mongo_client.coingecko.find_one({'id':keyword})
     # otherwise, fuzzy search the term:
     else: 
+        if check == False:
+            raise CoinNotFound(coin=keyword)
         return [x for x in mongo_client.coingecko.find({'$text':{'$search':keyword}},{'_id':0})]
 
 def dbck(coin, key='id') -> dict:
     '''single-coin lookup'''
     r = [x for x in mongodb.coingecko.find({key:coin})]
     if not r:
-        raise CoinNotFound
+        raise CoinNotFound(coin=coin)
     else:
         return r[0]
 
-def get_quickchart_img(post_data: dict):
+def get_quickchart_img(post_data: dict) -> bool:
     '''returns image file directly'''
-    print('creating chart')
+    logger.debug('creating quickchart')
     r = requests.post(quickchart_url, json=post_data)
     if r.status_code == requests.codes.ok:
         with open('chart.png', 'wb') as f:
             f.write(r.content)
-        print('chart creation True')
+        logger.debug('chart created true')
         return True
     else:
-        print('chart creation False')
+        logger.debug('chart creation failed')
         return False
 
 def get_coinvals(coins:list, vs=['usd']) -> dict:
@@ -71,7 +76,7 @@ def get_stats(orders: list) -> dict:
     coins = set(x.get('currency') for x in orders) #set of currencies in the user's orders
     stats = {}
     coinStats = []
-    print('getting coins')
+    logger.info('get_stats fetching coins')
     # coinval = get_coinvals(coins)
     cv = [x for x in mongodb.coin_latest.find({'currency':{'$in':list(coins)}})] #latest values of user currencies
     coinval = dict(zip([x.get('currency') for x in cv],[x.get(x.get('currency')) for x in cv])) #remap to dict for easy lookup
@@ -129,7 +134,7 @@ def get_stats(orders: list) -> dict:
             'invested': totalSpent-totalProfit,
             },
         'coinStats':coinStats}
-    print(stats.get('summary').get('roi'))
+    logger.info(f"get_stats roi: {stats.get('summary').get('roi')}")
     return stats
 
 def coin_hist(coin_id: str, days, vs='usd') -> dict:
@@ -142,9 +147,9 @@ def coin_hist(coin_id: str, days, vs='usd') -> dict:
         'localization':'false',
         }
     r = requests.get(url, params=p)
-    print(r.request.url)
+    logger.debug(f'coin_hist {r.request.url}')
     if not r.status_code == 200:
-        print(r.status_code)
+        logger.debug(f'coin_hist {r.status_code}')
         raise logging.error
     else:
         val = r.json().get('market_data').get('current_price').get(vs)
@@ -171,12 +176,13 @@ def coin_market(coin_id: str, days:int) -> dict:
         pcts = [(values[n]-values[0])/values[0]*100 for n in range(len(values))]
         current = values[-1]
         oldest = (dt.datetime.today()-dt.datetime.utcfromtimestamp(unixdates[0]/1000)).days
-        print(dates[0], expectedDate)
-        logger.info(dates[0], expectedDate)
+        # print(dates[0], expectedDate)
+        logger.info(f'{dates[0]}, {expectedDate}')
         err = True if dates[0] != expectedDate else False
         return {'dates': dates, 'values': pcts, 'current': current, 'error':err, 'oldest': oldest, 'oldestDate':dates[0]}
     else:
-        print(r.status_code, r.json())
+        # print(r.status_code, r.json())
+        logging.info(f'{r.status_code} : {r.json()}')
         raise logging.error
 
 def tax_dates(txns: list) -> dict:
@@ -199,7 +205,7 @@ def match_coin(key:str, source:str=None) -> str:
     return coingecko_id.get('coingecko_id') if coingecko_id else None
 
 def file_import(attachment: discord.File, source: str, userid: str):
-    '''import data from csv depending on export?'''
+    '''import data from coinbase or gemini'''
     import pandas as pd
     import csv
     if source == 'coinbase':
@@ -349,8 +355,10 @@ class Scheduler(commands.Cog):
             logger.debug(f'Updated coins: {coins}')
 
 class CoinNotFound(commands.CommandError):
-    def __init__(self, *args, **kwargs):
-        self.msg = '''CoinNotFound error message: try again nerd'''
+    def __init__(self, coin, *args, **kwargs):
+        self.coin = coin
+        self.msg = f'{coin} not found. try again nerd'''
+        logger.error(msg=self.msg, exc_info=True)
         super().__init__(*args, **kwargs)
 
 intents = discord.Intents.default()
@@ -402,7 +410,7 @@ async def _cryptohelp(ixn: discord.Interaction):
         Support me: [Ko-fi](https://ko-fi.com/eulaly)
         LTC ||`ltc1qqcmyulnyx97a2sx4q9n3gmxqctgyg09y37ljsg`||
         ''')
-    print(f'cryptohelp message length: {len(msg)}')
+    logger.debug(f'cryptohelp message length: {len(msg)}')
     #if len(msg) > 5999:
     #    raise _cryptohelp.error?
     msg.set_footer(
@@ -455,7 +463,31 @@ async def _buy(ixn: discord.Interaction, amount: float, currency: str, price:flo
 @bot.tree.command(name="sell", description="Add sale (USD). default to today's date")
 async def _sell(ixn:discord.Interaction, amount:float, currency:str, price:float, date:str=None):
     '''add a sale to your portfolio. if no date is provided, today's date will be used.'''
-    await _buy(ixn=ixn, amount=-1*float(amount), currency=currency, price=-1*float(price), date=date)
+    if currency not in [x for x in mongo_client.coingecko.distinct('id')]:
+
+        coinList = search_coins(currency)
+        msg = '''Coin not found. Did you mean one of these?
+    • `!buy` and `!sell` use coin **`id`** (no caps, use dashes instead of spaces)
+    • comparison arguments need **`symbol`**
+    Try **`!search [coin name]`** or check coingecko.com for the full list
+    Symbol \t | \t Name \t | \t id \n'''
+        for coin in coinList[:5]:
+            msg+=f'```{coin.get("symbol")}\t{coin.get("name")}\t{coin.get("id")}```'
+        msg+= 'Try **`!search [coin name]`** or check coingecko.com for the full list'
+        await ixn.response.send_message(msg)
+    else:
+        if not date:
+            date = dt.datetime.today().strftime('%Y-%m-%d')
+        txn = {
+            'amount': -1*amount,
+            'currency': currency,
+            'price': -1*price,
+            'date': date,
+            'userid':str(ixn.user.id)
+            }
+        mongodb.txns.insert_one(txn)
+    await ixn.user.send(f'{ixn.user.name} sold {amount} {currency} for {price} USD')
+    # await _buy(ixn=ixn, amount=-1*float(amount), currency=currency, price=-1*float(price), date=date)
 
 # UNTESTED 
 @bot.tree.command(name="coin", description="pm you your portfolio. updated every 5 min")
@@ -465,10 +497,10 @@ async def _coin(ixn:discord.Interaction, flex:discord.Member=None):  # add suppo
     if not userTxns:
         msg = "No orders found. Add crypto purchases to your portfolio with: ```/txn {amount of crypto} {cryptocurrency} {$USD paid}```"
         embed = None
-        await ixn.send(msg)
+        await ixn.response.send_message(msg)
         return
     else:
-        # ixn.response.defer(thinking=True)
+        await ixn.response.defer(thinking=True)
         stats = get_stats(userTxns)
         sstats = sorted(stats.get('coinStats'), key=lambda x:x.get('coinValue'), reverse=True)
         pv = "{:,.2f}".format(stats.get('summary').get('totalValue'))
@@ -500,8 +532,9 @@ async def _coin(ixn:discord.Interaction, flex:discord.Member=None):  # add suppo
             return
         msg = '' #consider adding timestamp?
         # print(f' follow up: {ixn.followup.channel.name}')
-        # await ixn.followup.send(msg, embed=embed, file=chartfile)
-        await ixn.response.send_message(msg, embed=embed,file=chartfile)
+        await ixn.followup.send(msg, embed=embed, file=chartfile, ephemeral=True)
+        # await ixn.response.send_message(msg, embed=embed,file=chartfile, ephemeral=True)
+        # await ixn.response.send_message(msg, embed=embed,file=chartfile)
 
 #UNTESTED
 @bot.tree.command(name="flex", description = 'flex on the boys. tag a boy to flex on him')
@@ -525,29 +558,32 @@ async def flex_error(ixn:discord.Interaction, error):
 async def _search(ixn:discord.Interaction, keyword:str):
     '''search for supported coins. favors coin symbol'''
     coinList = search_coins(keyword=keyword)
-    msg = f'''Here are the first 10 results for `{keyword}`: \nSymbol \t | \t Name \t | \t id'''
+    msg = f'''Found {len(coinList)} results for `{keyword}`, here are the first ten: \nSymbol \t | \t Name \t | \t id'''
     for coin in coinList[:10]:
         msg+=f'''```{coin.get("symbol")}\t{coin.get("name")}\t{coin.get("id")}```'''
     msg+= '''• You must use this exact `id` for `/buy`, `/sell`, `/market`, and `/compare`'''
     if not coinList:
         msg = '''No results. Try again, or check [CoinGecko](https://www.coingecko.com/en/all-cryptocurrencies).'''
-    await ixn.channel.send(msg)
+    await ixn.response.send_message(msg)
 
 #UNTESTED
 @bot.tree.command(name="market", description="get market data for a coin")
 async def _market(ixn:discord.Interaction, coin_id:str, days:int=90, vs:str='usd'):
 # async def _market(ixn:discord.Interaction, coin_id: str, days:int=90, vs:str='usd'):
     '''get market data for a coin'''
+    # ixn.response.defer(thinking=True)
     coin = dbck(coin_id).get('id')
     data = coin_market(coin, days=days)
     #error handling for `/market_chart` which returns 200 json() without 'market_data' if date is too old
     if data.get('error') == True:  # this appears not to work. coingecko might auto-adjust this now. [2024-03-02]
-        await ixn.channel.send(f'Rerunning with oldest available date ({days} days ago)')
+        # await ixn.channel.send(f'Rerunning with oldest available date ({days} days ago)')
+        logger.info(f'Rerunning with oldest available date ({days} days ago)')
         days = data.get('oldest')
         data = coin_market(coin,days=days)
+
     coinval_date = coin_hist(coin, days=days)
-    logging.info(f'market - {type(coinval_date)} {coinval_date}')
-    logging.info(f'market - {type(data)} {data.get("values")}')
+    # logging.info(f'market - {type(coinval_date)} {coinval_date}')
+    # logging.debug(f'market - {type(data)} {data.get("values")}')
     chart = {'chart':{'type':'line', 'data':{
         'labels':data.get('dates'),
         'datasets':[{'label':coin,'data':data.get('values'),'borderWidth':1, 'pointRadius':1, 'fill': 'False'}],
@@ -558,12 +594,16 @@ async def _market(ixn:discord.Interaction, coin_id:str, days:int=90, vs:str='usd
     emb = discord.Embed(title=f'{coin} % change since {data.get("dates")[0]}',
         description=f'{coin}: {round(data.get("values")[-1],4)}% from {round(coinval_date,2)} {vs} to {round(data.get("current"),2)}', type='rich')
     emb.set_image(url=f'attachment://chart.png')
-    await ixn.channel.send(embed=emb,file=chartfile)
+    # await ixn.followup.send(embed=emb, file=chartfile)
+    # await ixn.channel.send(embed=emb,file=chartfile)
+    await ixn.response.send_message(embed=emb,file=chartfile)
 @_market.error
 async def _market_error(ixn:discord.Interaction, error: CoinNotFound):
+    # might be an issue since the error here is expecting an AppCommandError, and it is missing a needed proeprty.
     logger.info(error)
+    await ixn.response.send_message(error.msg)
     if isinstance(error, CoinNotFound):
-        await ixn.channel.send(error.msg)
+        await ixn.response.send_message(content=error.msg)
 
 #UNTESTED
 @bot.tree.command(name="compare", description='compare performance of 2 coins')
@@ -602,13 +642,13 @@ async def _compare(ixn:discord.Interaction, id1:str, id2:str, days:int=90):
 async def _compare_error(ixn:discord.Interaction, error):
     if isinstance(error, CoinNotFound):
         logger.error(error.msg)
-        print(error.msg)
-        await ixn.channel.send(error.msg)
+        # print(error.msg)
+        await ixn.response.send_message(error.msg)
 
-@bot.command(name="txns")
-async def _txns(ctx, coin=None):
+@bot.tree.command(name="txns")
+async def _txns(ixn:discord.Interaction, coin:str=None):
     '''find all your txns with a specific coin'''
-    searchTerms = {'userid':str(ctx.author.id)}
+    searchTerms = {'userid':str(ixn.user.id)}
     if coin:
         searchTerms['currency'] = coin
     data = [x for x in mongodb.txns.find(searchTerms)]
@@ -624,7 +664,8 @@ async def _txns(ctx, coin=None):
                 # msg+= f'\n```css\n{str(d.get("_id"))}` *${d.get("price")} exchanged for {d.get("amount")} {d.get("currency")} on {d.get("date")}*'
         # add reaction to see next page? 
         # sort by most recent txns
-        await ctx.author.send(msg)
+        await ixn.response.send_message(content=msg, ephemeral=True)
+        # await ctx.author.send(msg)
         msg = ""
 
 @bot.command(name="delete")
@@ -643,6 +684,7 @@ async def _import(ixn: discord.Interaction, file:discord.Attachment, source: Lit
         color = discord.Color.orange(),
         description=f'''Found {len(txns)} transactions: ''')
     msg.add_field(name='', value='`date\tamount\tcurrency\tprice`')
+    # ...don't do this. look at txns and chunker.
     for i, x in enumerate(txns[:21]):
         msg.add_field(name=i+1, value=f"`{x.get('date')}\t{x.get('amount')}\t{x.get('currency')}\t${x.get('price')}`")
     # TODO check , is this correct?

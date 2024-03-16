@@ -72,29 +72,76 @@ def get_coinvals(coins:list, vs=['usd']) -> dict:
     r = requests.get(base, params=p)
     return r.json() if r.status_code == 200 else None
 
+def get_stats2(userid:str) -> dict:
+    logger.info('get_stats2 fetching coins')
+    
+    #get the set of the user's coins and the latest values
+    user_coins = mongo_client.txns.distinct('currency', {'userid':userid}) 
+    coin_latest = list(mongo_client.coin_latest.find({'currency':{'$in':user_coins}}))
+
+    # get the average of all user txns with price >= 0 
+    buyAvg_pipeline = [
+    {'$match': {'userid':userid}},
+    {'$match': {'price':{'$gte':0}}},
+    {'$group': {
+        '_id':'$currency',
+        'buyAvg':{'$avg':'$price'}
+    }}
+    ]
+    # get the average of all user txns with price < 0 
+    saleAvg_pipeline = [
+        {'$match': {'userid':userid}},
+        {'$match': {'price':{'$lt':0}}},
+        {'$group': {
+            '_id':'$currency',
+            'buyAvg':{'$avg':'$price'}
+        }}
+        ]
+    buyAvg = list(mongo_client.txns.aggregate(buyAvg_pipeline))
+    salevg = list(mongo_client.txns.aggregate(saleAvg_pipeline))
+
+    usdSpent_pipeline = [
+        {'$match': {'userid':userid}},
+        {'$match': {'price':{'$gte':0}}},
+        # {'$match': {''}}
+        {'$group': {
+            '_id':'$currency',
+            'usdSpent':{'$sum':'$price'}
+        }}
+    ]
+
+    data = []
+    for coin in user_coins:
+        data.append(
+            {
+                'coin': coin,
+                # 'coinUSD': coin_latest.get(coin),
+                'coinUSD': float(mongo_client.coin_latest.find_one({'currency':coin}).get('usd')),
+                'usdSpent': float()
+            }
+        )
+
 def get_stats(orders: list) -> dict:
     coins = set(x.get('currency') for x in orders) #set of currencies in the user's orders
     stats = {}
     coinStats = []
     logger.info('get_stats fetching coins')
+    
     # coinval = get_coinvals(coins)
     cv = [x for x in mongodb.coin_latest.find({'currency':{'$in':list(coins)}})] #latest values of user currencies
     coinval = dict(zip([x.get('currency') for x in cv],[x.get(x.get('currency')) for x in cv])) #remap to dict for easy lookup
+    
     for coin in coins:
         txns = list(filter(lambda x:x.get('currency')==coin, orders)) #filter orders by this coin
+        # txns = [x for x in mongo_client.txns.find({'userid':userid,'currency':coin}) # or just do another lookup? 
+
         buys = [x for x in txns if x.get('price') >= 0] #mining counts as buys
         sales = [x for x in txns if x.get('price') < 0]
-
-        #old
-        # buyAvg = [x.get('price')/x.get('amount') for x in txns if x.get('price') >= 0]
-        # saleAvg = [-1*x.get('price')/x.get('amount') for x in txns if x.get('price') < 0]
-        #new 22mar22
         buyAvg = sum([x.get('price') for x in buys])/sum([x.get('amount') for x in buys])
         if not sales:
             saleAvg = 0
         else:
             saleAvg = sum([x.get('price') for x in sales])/sum([x.get('amount') for x in sales])
-
         d = {
             'coin': coin,
             'coinUSD': coinval.get(coin).get('usd'),  #need to rebuild pymongo call into a dict for this to work
@@ -128,14 +175,14 @@ def get_stats(orders: list) -> dict:
             'totalSpent': totalSpent,
             'totalGain': totalValue-totalSpent,
             'totalProfit': totalProfit,
-            # 'roi': totalValue/totalSpent, #old
-            # 'roi': (totalValue-totalSpent)/totalSpent, #better
-            'roi': (totalValue-(totalSpent-totalProfit))/(totalSpent-totalProfit),
+            # 'roi': (totalValue-(totalSpent-totalProfit))/(totalSpent-totalProfit),
+            'roi': (totalProfit + (totalValue - totalSpent)) / totalSpent,
             'invested': totalSpent-totalProfit,
             },
         'coinStats':coinStats}
     logger.info(f"get_stats roi: {stats.get('summary').get('roi')}")
     return stats
+
 
 def coin_hist(coin_id: str, days, vs='usd') -> dict:
     '''get a single coin's value at a date in the past'''
@@ -185,6 +232,10 @@ def coin_market(coin_id: str, days:int) -> dict:
         logging.info(f'{r.status_code} : {r.json()}')
         raise logging.error
 
+def coin_vs():
+    '''convert any value to another currency'''
+    pass
+
 def tax_dates(txns: list) -> dict:
     '''return tax dates for a set of txns'''
     txns = sorted(txns, key=lambda x: x.get('date'), reverse=True)
@@ -223,9 +274,10 @@ def file_import(attachment: discord.File, source: str, userid: str):
         for index, row in coinbase.iterrows():
             currency = row.get("Asset") #load here, match later.
             amount = float(row.get("Quantity Transacted"))
+            price = row.get("Total (inclusive of fees and/or spread)")
             if row.get("Transaction Type") == 'Sell':
                 amount = amount * -1
-            price = row.get("Total (inclusive of fees and/or spread)")
+                price = price * -1
             date_str = row.get('ddate').strftime('%Y-%m-%d')
             row_dict = {'date': date_str, 'amount': amount, 'currency': currency, 'price': price, 'userid':userid}
             txns.append(row_dict)
@@ -457,7 +509,8 @@ async def _buy(ixn: discord.Interaction, amount: float, currency: str, price:flo
             'userid':str(ixn.user.id)
             }
         mongodb.txns.insert_one(txn)
-        await ixn.user.send(f'{ixn.user.name} bought {amount} {currency} for {price} USD')
+        await ixn.response.send_message(f'{ixn.user.name} bought {amount} {currency} for {price} USD', ephemeral=True)
+        # await ixn.user.send(f'{ixn.user.name} bought {amount} {currency} for {price} USD')
 
 # UNTESTED
 @bot.tree.command(name="sell", description="Add sale (USD). default to today's date")
@@ -500,8 +553,9 @@ async def _coin(ixn:discord.Interaction, flex:discord.Member=None):  # add suppo
         await ixn.response.send_message(msg)
         return
     else:
-        await ixn.response.defer(thinking=True)
+        # await ixn.response.defer(thinking=True)
         stats = get_stats(userTxns)
+        logger.info(stats)
         sstats = sorted(stats.get('coinStats'), key=lambda x:x.get('coinValue'), reverse=True)
         pv = "{:,.2f}".format(stats.get('summary').get('totalValue'))
         # roi = round(stats.get('summary').get('totalValue')/stats.get('summary').get('totalSpent')*100-100,2)
@@ -532,8 +586,8 @@ async def _coin(ixn:discord.Interaction, flex:discord.Member=None):  # add suppo
             return
         msg = '' #consider adding timestamp?
         # print(f' follow up: {ixn.followup.channel.name}')
-        await ixn.followup.send(msg, embed=embed, file=chartfile, ephemeral=True)
-        # await ixn.response.send_message(msg, embed=embed,file=chartfile, ephemeral=True)
+        # await ixn.followup.send(msg, embed=embed, file=chartfile, ephemeral=True)
+        await ixn.response.send_message(msg, embed=embed,file=chartfile, ephemeral=True)
         # await ixn.response.send_message(msg, embed=embed,file=chartfile)
 
 #UNTESTED

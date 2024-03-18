@@ -40,3 +40,15 @@ def coinbase_txns():
         'CB-ACCESS-TIMESTAMP': coinbase_time()
     }
     url = 'https://api.coinbase.com/v2/accounts/:account_id/transactions'
+
+def cb_get_currencies():
+    url = 'https://api.exchange.coinbase.com/currencies'
+    headers = {'Content-Type': 'application/json'}
+    r = requests.get(url)
+    return r
+
+def cb_get_coins():
+    url = 'https://api.coinbase.com/v2/currencies/crypto'
+    headers = {'Content-Type': 'application/json'}
+    r = requests.get(url)
+    return r

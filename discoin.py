@@ -9,12 +9,15 @@ from bson import ObjectId
 import discord
 from discord.ext import commands, tasks
 from typing import Literal, Optional
+import pandas as pd 
 # from coinbase import CoinbaseWalletAuth
 
 discoin_owner_id = int(getenv("discoin_owner_id"))
 cg_demo_key = getenv("cg_demo_key")
 cb_access_key = getenv("cb_access_key")
+discoin = MongoClient(getenv('mongodb_url')).discoin
 mongo_client = MongoClient(getenv('mongodb_url')).discoin  #"mongo_client" is almost certainly...safer
+# mongo_client = MongoClient(getenv('mongodb_url'))  #"mongo_client" is almost certainly...safer
 mongodb = MongoClient(getenv('mongodb_url')).discoin
 quickchart_url = getenv("quickchart_url")
 discoin_version = 'v2.0a'
@@ -37,9 +40,9 @@ def search_coins(keyword:str, check:bool=False):
         return mongo_client.coingecko.find_one({'id':keyword})
     # otherwise, fuzzy search the term:
     else: 
-        if check == False:
+        if check == True:
             raise CoinNotFound(coin=keyword)
-        return [x for x in mongo_client.coingecko.find({'$text':{'$search':keyword}},{'_id':0})]
+    return [x for x in mongo_client.coingecko.find({'$text':{'$search':keyword}},{'_id':0})]
 
 def dbck(coin, key='id') -> dict:
     '''single-coin lookup'''
@@ -48,6 +51,18 @@ def dbck(coin, key='id') -> dict:
         raise CoinNotFound(coin=coin)
     else:
         return r[0]
+
+def cb_cg(coinbase_id:str):
+    coinbase_name = mongo_client.coinbase.find_one({'$or': [{'code':coinbase_id},{'id':coinbase_id}]})
+    if coinbase_name:
+        coingecko = mongo_client.coingecko.find_one({'name':coinbase_name.get('name')})
+        if coingecko:
+            return coingecko.get('id')
+        else:
+            return None 
+            # raise CoinNotFound
+            # fuzzy_results = list(mongo_client.coingecko.find({'$text':{'$search':coinbase.get('name')}},{'_id':0}))
+            # return ','.join([f'{x.get("id")}/{x.get("name")}' for x in fuzzy_results[:3]])
 
 def get_quickchart_img(post_data: dict) -> bool:
     '''returns image file directly'''
@@ -132,10 +147,13 @@ def get_stats(orders: list) -> dict:
     coinval = dict(zip([x.get('currency') for x in cv],[x.get(x.get('currency')) for x in cv])) #remap to dict for easy lookup
     
     for coin in coins:
+        logger.info(f'getting coin {coin}')
         txns = list(filter(lambda x:x.get('currency')==coin, orders)) #filter orders by this coin
         # txns = [x for x in mongo_client.txns.find({'userid':userid,'currency':coin}) # or just do another lookup? 
 
         buys = [x for x in txns if x.get('price') >= 0] #mining counts as buys
+        if not buys:
+            buys = [0]
         sales = [x for x in txns if x.get('price') < 0]
         buyAvg = sum([x.get('price') for x in buys])/sum([x.get('amount') for x in buys])
         if not sales:
@@ -255,61 +273,83 @@ def match_coin(key:str, source:str=None) -> str:
         coingecko_id = mongo_client.coinref.find_one({'coin':key})
     return coingecko_id.get('coingecko_id') if coingecko_id else None
 
-def file_import(attachment: discord.File, source: str, userid: str):
-    '''import data from coinbase or gemini'''
-    import pandas as pd
-    import csv
-    if source == 'coinbase':
-        ''' generate a report from your account > Transaction History > generate report > alltime/assets/txns > csv'''
-        coinbase = pd.read_csv(attachment, skiprows=7)
-        coinbase['ddate'] = pd.to_datetime(coinbase.Timestamp)
-        coinbase.set_index(coinbase.ddate, inplace=True)
-        coinbase = coinbase.loc[(coinbase['Transaction Type'] == 'Buy') | (coinbase['Transaction Type'] == 'Sell')]
-        currencies = list(set(coinbase["Spot Price Currency"].tolist()))
-        for x in currencies:
-            if x != "USD":
-                logger.warn(f'Found buy/sale not listed in USD! Please convert: \n\t {coinbase.loc[coinbase["Spot Price Currency"] == x]}')
-                return
-        txns = []
-        for index, row in coinbase.iterrows():
-            currency = row.get("Asset") #load here, match later.
-            amount = float(row.get("Quantity Transacted"))
-            price = row.get("Total (inclusive of fees and/or spread)")
-            if row.get("Transaction Type") == 'Sell':
-                amount = amount * -1
-                price = price * -1
-            date_str = row.get('ddate').strftime('%Y-%m-%d')
+
+def import_coinbase(attachment: discord.File, userid: str):
+    '''import data from coinbase.
+    generate a report from your account > Transaction History
+     > generate report > alltime/assets/txns > csv
+    '''
+    # check file is csv
+    coinbase = pd.read_csv(attachment, skiprows=7)
+    coinbase['ddate'] = pd.to_datetime(coinbase.Timestamp)
+    coinbase.set_index(coinbase.ddate, inplace=True)
+
+    # think about this . . .
+    currencies = list(set(coinbase["Spot Price Currency"].tolist()))
+    for x in currencies:
+        if x != "USD":
+            logger.warn(f'Found buy/sale not listed in USD! Please convert: \n\t {coinbase.loc[coinbase["Spot Price Currency"] == x]}')
+            return
+
+    buy_type = ['Advanced Trade Buy','Buy','Learning Reward','Receive', 'Rewards Income']
+    sale_type = ['Sell','Send']
+        
+    txns = []
+    for index, row in coinbase.iterrows():
+
+        if row["Transaction Type"] == "Convert": # FIX - from [Asset] to [regex last word (space) from 'Notes']
+            continue                # add 2nd txn? loss 1 coin, gain another? 
+
+        currency = row.get["Asset"] #load here, match later.
+        amount = float(row["Quantity Transacted"])
+        price = row["Total (inclusive of fees and/or spread)"]
+        if row["Transaction Type"] in sale_type:
+            amount = amount * -1
+            price = price * -1
+            if row["Transaction Type"] == 'Rewards Income':
+                price = 0
+        date_str = row['ddate'].strftime('%Y-%m-%d')
+        row_dict = {'date': date_str, 'amount': amount, 'currency': currency, 'price': price, 'userid':userid}
+        txns.append(row_dict)
+    
+    cb_currency = list(set([x.get('currency') for x in txns]))
+    logger.info(f'Found {len(cb_currency)} currencies to lookup.')
+    coinbase['coingecko'] = coinbase['Asset'].apply(cb_cg)
+    unmatched = coinbase[coinbase['coingecko'].isna()]
+    if not unmatched.empty:
+        unmatched_coins = list(set(unmatched.Asset.tolist()))
+        logger.info(f'Found {len(unmatched_coins)} unmatched coins:\n {unmatched_coins}')
+        logger.info(f'Found {len(set(unmatched.Asset.tolist))} unmatched coins:\n {unmatched.to_string()}')
+    else: 
+        logger.info(f'Matched {len(set(coinbase.Asset.tolist()))} coins successfully.')
+    logger.info(f'Found {len(txns)} txns from {attachment.filename}')
+    logger.debug(f'Found {len(txns)} txns from {attachment.filename}:{txns}')
+
+    # mongo_client.txns.insert_many(txns)
+    # save to db
+    return txns   
+
+def import_gemini(attachment: discord.File, userid: str):
+    '''gemini transaction_history as of March 2024'''
+    gemini = pd.read_excel(attachment)
+    gemini['ddate'] = pd.to_datetime(gemini.Date)
+    gemini.set_index(gemini.ddate, inplace=True)
+    # gd = gemini.filter(like="Amount") \
+    #     .apply(lambda row: {'ddate': row.name, **{col: val for col, val in row.items() if pd.notna(val)}}, axis=1) \
+    #     .tolist()
+    # df.apply(lambda row: {col: val for col, val in row.items() if pd.notna(val)}, axis=1).tolist()
+    txns = []
+    for index, row in gemini.iterrows():
+    # Find the currency column and amount
+        currency_col = [col for col in gemini.columns if "Amount" in col and col != "USD Amount USD" and pd.notnull(row[col])]
+        if currency_col:
+            currency_col = currency_col[0]
+            currency = currency_col.split(" ")[0]  # Assuming currency is the first word in the column name
+            amount = row[currency_col]
+            price = row["USD Amount USD"] * -1
+            date_str = index.strftime('%Y-%m-%d')
             row_dict = {'date': date_str, 'amount': amount, 'currency': currency, 'price': price, 'userid':userid}
             txns.append(row_dict)
-        
-        cb_currency = list(set([x.get('currency') for x in txns]))
-        logger.info(f'Found {len(cb_currency)} currencies to lookup.')
-        
-        for t in txns: #lookup/match currency values
-            t['currency'] = match_coin(t.get('currency'))
-
-                
-    elif source == 'gemini':
-        '''gemini transaction_history as of March 2024'''
-        gemini = pd.read_excel(attachment)
-        gemini['ddate'] = pd.to_datetime(gemini.Date)
-        gemini.set_index(gemini.ddate, inplace=True)
-        # gd = gemini.filter(like="Amount") \
-        #     .apply(lambda row: {'ddate': row.name, **{col: val for col, val in row.items() if pd.notna(val)}}, axis=1) \
-        #     .tolist()
-        # df.apply(lambda row: {col: val for col, val in row.items() if pd.notna(val)}, axis=1).tolist()
-        txns = []
-        for index, row in gemini.iterrows():
-        # Find the currency column and amount
-            currency_col = [col for col in gemini.columns if "Amount" in col and col != "USD Amount USD" and pd.notnull(row[col])]
-            if currency_col:
-                currency_col = currency_col[0]
-                currency = currency_col.split(" ")[0]  # Assuming currency is the first word in the column name
-                amount = row[currency_col]
-                price = row["USD Amount USD"] * -1
-                date_str = index.strftime('%Y-%m-%d')
-                row_dict = {'date': date_str, 'amount': amount, 'currency': currency, 'price': price, 'userid':userid}
-                txns.append(row_dict)
     
     logger.info(f'Found {len(txns)} txns from {attachment.filename}')
     logger.debug(f'Found {len(txns)} txns from {attachment.filename}:{txns}')
@@ -383,6 +423,28 @@ class Scheduler(commands.Cog):
             mongo_client.coingecko.delete_many({})
             mongo_client.coingecko.insert_many(r.json())
             logger.info(f'Found {len(r.json())} coins, added to mongodb discoin.coingecko')
+        else:
+            logger.warning(f'Failed to refresh discoin.coingecko')
+
+    @tasks.loop(hours=24)
+    async def refresh_coinbase(self):
+        '''check coinbase for new coins: https://docs.cloud.coinbase.com/exchange/reference/exchangerestapi_getcurrency'''
+        url = 'https://api.coinbase.com/v2/currencies/crypto'
+        url2 = 'https://api.exchange.coinbase.com/currencies'
+        headers = {'Content-Type': 'application/json'}
+        r = requests.get(url, headers=headers)
+        r2 = requests.get(url2, headers=headers)
+        if r.status_code == 200 and r2.status_code == 200:
+            mongo_client.coinbase.delete_many({})
+            mongo_client.coinbase.insert_many(r.json().get('data'))
+            mongo_client.coinbase.insert_many(r2.json())
+            logger.info(f'Found {len(r.json())} coins, added to mongodb discoin.coinbase')
+            logger.info(f'Found {len(r2.json())} coins, added to mongodb discoin.coinbase')
+        else:
+            logger.warning(f'''Failed to refresh discoin.coinbase \n 
+                            {url}:{r.status_code} \n 
+                            {url2}:{r2.status_code}'''
+            )
 
     @tasks.loop(minutes=5)
     async def update_coinvals(self, vs=['usd']):
@@ -709,7 +771,7 @@ async def _txns(ixn:discord.Interaction, coin:str=None):
     msg = "Your transactions"
     if coin: 
         msg += f" with {coin}"
-    msg+= f'\n To delete a transaction, find the txn id and type `!delete [txnid]`'
+    msg+= f'\n To delete a transaction, find the txn id and type `/delete [txnid]`'
     chunked = list(chunker(data,20))
     for l in chunked:                       #discord's 2k char limit is hit @ ~25 txns
         for d in l:
@@ -719,14 +781,20 @@ async def _txns(ixn:discord.Interaction, coin:str=None):
         # add reaction to see next page? 
         # sort by most recent txns
         await ixn.response.send_message(content=msg, ephemeral=True)
-        # await ctx.author.send(msg)
         msg = ""
 
-@bot.command(name="delete")
-async def _delete(ctx, txnid):
+@bot.tree.command(name="delete")
+async def _delete(ixn: discord.Interaction, txnid:str):
     '''remove a txn from your orders by id'''
-    mongodb.txns.delete_one({'_id':ObjectId(txnid), 'userid':str(ctx.author.id)})
-    await ctx.message.add_reaction('✅')
+    txn_to_delete = mongo_client.txns.find_one({'_id': ObjectId(txnid), 'userid':str(ixn.user.id)})
+    if txn_to_delete:
+        logger.debug(f'Deleting transaction {txn_to_delete}')    
+        result = mongodb.txns.delete_one({'_id':ObjectId(txnid), 'userid':str(ixn.user.id)})
+        if result.deleted_count > 0:
+            msg = f'Deleted {txn_to_delete}'
+    else:
+        msg = 'Transaction not found with id: `{txnid}`. \n Use **/txns** to view your transactions.'
+    await ixn.response.send_message(msg, ephemeral=True)
 
 @bot.tree.command(name="import", description="import txns from coinbase or gemini")
 async def _import(ixn: discord.Interaction, file:discord.Attachment, source: Literal['coinbase', 'gemini']):
@@ -849,12 +917,12 @@ async def _sync(ctx: commands.Context, guilds: commands.Greedy[discord.Object], 
     logger.info(f"Synced the tree to {ret}/{len(guilds)}.")
     await ctx.author.send(f"Synced the tree to {ret}/{len(guilds)}.")
 
-
 async def main():
     discord.utils.setup_logging(level=logging.INFO, root=True)
     async with bot:
         await bot.add_cog(Scheduler(bot=bot))
         bot.tree.copy_global_to(guild=discord.Object(id='127214262123888640'))  # we copy the global commands we have to a guild, this is optional
         await bot.start(getenv('discoin_token'))
-    
-asyncio.run(main())
+
+if __name__ == "__main__":
+    asyncio.run(main())

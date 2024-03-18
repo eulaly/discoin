@@ -1,54 +1,45 @@
 import pandas as pd
 
-def file_import(attachment:str,source:str):
-    print(source)
+def import_cb(attachment:str, userid: str):
+    '''import data from coinbase.
+    generate a report from your account > Transaction History
+     > generate report > alltime/assets/txns > csv
+    '''
+    # check file is csv
+    coinbase = pd.read_csv(attachment, skiprows=7)
+    coinbase['ddate'] = pd.to_datetime(coinbase.Timestamp)
+    # think about this . . .
+    currencies = list(set(coinbase["Spot Price Currency"].tolist()))
+    for x in currencies:
+        if x != "USD":
+            print(f'Found buy/sale not listed in USD! Please convert: \n\t {coinbase.loc[coinbase["Spot Price Currency"] == x]}')
+            return
+    buy_type = ['Advanced Trade Buy','Buy','Learning Reward','Receive', 'Rewards Income']
+    sale_type = ['Sell','Send']
     txns = []
-    if source == 'coinbase':
-        ''' generate a report from your account > Transaction History > generate report > alltime/assets/txns > csv'''
-        coinbase = pd.read_csv(attachment, skiprows=7)
-        print('loaded coinbase')
-        coinbase['ddate'] = pd.to_datetime(coinbase.Timestamp)
-        coinbase = coinbase.loc[(coinbase['Transaction Type'] == 'Buy') | (coinbase['Transaction Type'] == 'Sell')]
-        currencies = list(set(coinbase["Spot Price Currency"].tolist()))
-        print(currencies)
-        for x in currencies:
-            if x != "USD":
-                print(f'Found buy/sale not listed in USD! Please convert: \n\t {coinbase.loc[coinbase["Spot Price Currency"] == x]}')
-                return
-        print('iter')
-        for index, row in coinbase.iterrows():
-            currency = row.get("Asset")
-            amount = float(row.get("Quantity Transacted"))
-            if row.get("Transaction Type") == 'Sell':
-                amount = amount * -1
-            price = row.get("Total (inclusive of fees and/or spread)")
-            date_str = row.get('ddate').strftime('%Y-%m-%d')
-            row_dict = {'date': date_str, 'amount': amount, 'currency': currency, 'price': price}
-            txns.append(row_dict)
-        print(f'fonud {len(txns)} txns')
-    elif source == 'gemini':
-        '''gemini transaction_history as of March 2024'''
-        gemini = pd.read_excel(attachment)
-        print('loaded gemini')
-        gemini['ddate'] = pd.to_datetime(gemini.Date)
-        gemini.set_index(gemini.ddate, inplace=True)
-        # gd = gemini.filter(like="Amount") \
-        #     .apply(lambda row: {'ddate': row.name, **{col: val for col, val in row.items() if pd.notna(val)}}, axis=1) \
-        #     .tolist()
-        # df.apply(lambda row: {col: val for col, val in row.items() if pd.notna(val)}, axis=1).tolist()
-        for index, row in gemini.iterrows():
-        # Find the currency column and amount
-            currency_col = [col for col in gemini.columns if "Amount" in col and col != "USD Amount USD" and pd.notnull(row[col])]
-            if currency_col:
-                currency_col = currency_col[0]
-                currency = currency_col.split(" ")[0]  # Assuming currency is the first word in the column name
-                amount = row[currency_col]
-                price = row["USD Amount USD"] * -1
-                date_str = index.strftime('%Y-%m-%d')
-            
-                # Construct dictionary and append to list
-                row_dict = {'date': date_str, 'amount': amount, 'currency': currency, 'price': price}
-                txns.append(row_dict)
-        print(f'fonud {len(txns)} txns')
-    print(f'done')
-    return txns
+    for _, row in coinbase.iterrows():
+        if row.get("Transaction Type") == "Convert": # FIX - from [Asset] to [regex last word (space) from 'Notes']
+            continue                # add 2nd txn? loss 1 coin, gain another? 
+        currency = row.get("Asset") #load here, match later.
+        amount = float(row.get("Quantity Transacted"))
+        price = row.get("Total (inclusive of fees and/or spread)")
+        if row.get("Transaction Type") in sale_type:
+            amount = amount * -1
+            price = price * -1
+            if row.get("Transaction Type") == 'Rewards Income':
+                price = 0
+        date_str = row.get('ddate').strftime('%Y-%m-%d')
+        row_dict = {'date': date_str, 'amount': amount, 'currency': currency, 'price': price, 'userid':userid}
+        txns.append(row_dict)
+    cb_currency = list(set([x.get('currency') for x in txns]))
+    print(f'Found {len(cb_currency)} currencies to lookup.')
+    coinbase['coingecko'] = coinbase['Asset'].apply(cb_cg)
+    unmatched = coinbase[coinbase['coingecko'].isna()]
+    if not unmatched.empty:
+        unmatched_coins = list(set(unmatched.Asset.tolist()))
+        print(f'Found {len(unmatched_coins)} unmatched coins:\n {unmatched_coins}')
+    else: 
+        print(f'Matched {len(set(coinbase.Asset.tolist()))} coins successfully.')
+    print(f'Found {len(txns)} txns from {attachment}')
+    # mongo_client.txns.insert_many(txns)
+    return txns   

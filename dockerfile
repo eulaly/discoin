@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
-FROM python:3.7-alpine
+FROM python:3.11
 WORKDIR /app
-COPY requirements.txt /
-RUN pip install -r /requirements.txt
-COPY discoin-mongo.py discoin-mongo.py
+COPY requirements.txt /requirements.txt
+RUN python3 -m pip install --no-cache-dir -r /requirements.txt
+COPY discoin.py discoin.py
 ENV api_token=""
 ENV mongodb_url=""
-CMD [ "python3", "./discoin-mongo.py"]
+CMD [ "python3", "./discoin.py"]

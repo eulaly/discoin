@@ -2,7 +2,8 @@ from os import getenv, listdir, remove
 import asyncio
 import requests
 import datetime as dt
-from json import dump as jdump
+from json import dump as jdump, load as jload, loads as jloads
+import json
 import logging 
 from pymongo import MongoClient
 from bson import ObjectId
@@ -16,6 +17,7 @@ discoin_owner_id = int(getenv("discoin_owner_id"))
 cg_demo_key = getenv("cg_demo_key")
 cb_access_key = getenv("cb_access_key")
 discoin = MongoClient(getenv('mongodb_url')).discoin
+#mongo_discoin = MongoClient(getenv('mongodb_url')).discoin
 mongo_client = MongoClient(getenv('mongodb_url')).discoin  #"mongo_client" is almost certainly...safer
 # mongo_client = MongoClient(getenv('mongodb_url'))  #"mongo_client" is almost certainly...safer
 mongodb = MongoClient(getenv('mongodb_url')).discoin
@@ -58,6 +60,14 @@ def make_coinref(coingecko, coinbase):
     coingecko['type'] = 'coingecko'
     coinbase['type'] = 'coinbase'
     return
+
+def gm_cg(gemini_id:str):
+    '''find coingecko coin to match a given gemini id'''
+    # match name first
+    coingecko = mongo_client.coingecko.find({'name':gemini_id})
+    coingecko = mongo_client.gemini.find_one({'$or': [{'code':gemini_id},{'id':gemini_id}]})
+
+    [mongo_client.coingecko.find_one({'symbol':x.lower()}) for x in et]
 
 def cb_cg(coinbase_id:str):
     '''find a coingecko coin to match a given coinbase id'''
@@ -285,8 +295,17 @@ def match_coin(key:str, source:str=None) -> str:
         coingecko_id = mongo_client.coinref.find_one({'coin':key})
     return coingecko_id.get('coingecko_id') if coingecko_id else None
 
+def import_csv(attachment: discord.File, userid: str) -> list:
+    '''import csv transactions formatted for discoin'''
+    df = pd.read_csv(attachment)
+    mask = lambda x:search_coins(df.currency)
+    # check date format is YYYY-MM-DD
+    # check amount is numbers only -> float
+    # check currency exists in coingecko
+    # check price is numbers only
+    # add userid
 
-def import_coinbase(attachment: discord.Attachment, userid: str) -> list:
+def import_coinbase(attachment: discord.File, userid: str) -> list:
     '''import data from coinbase.
     generate a report from your account > Transaction History
      > generate report > alltime/assets/txns > csv
@@ -302,8 +321,9 @@ def import_coinbase(attachment: discord.Attachment, userid: str) -> list:
     currencies = list(set(coinbase["Spot Price Currency"].tolist()))
     for x in currencies:
         if x != "USD":
-            logger.warn(f'Found buy/sale not listed in USD! Please convert: \n\t {coinbase.loc[coinbase["Spot Price Currency"] == x]}')
-            return
+            msg = f'Found buy/sale not listed in USD! Please convert: \n\t {coinbase.loc[coinbase["Spot Price Currency"] == x]}'
+            logger.warn(msg)
+            return([msg,None,None])
 
     buy_type = ['Advanced Trade Buy','Buy','Learning Reward','Receive', 'Rewards Income']
     sale_type = ['Sell','Send', 'Convert']
@@ -344,16 +364,17 @@ def import_coinbase(attachment: discord.Attachment, userid: str) -> list:
         msg2 = f'Found {len(set(unmatched_coins))} unmatched coins:\n {unmatched.to_string()}'
         logger.info(msg2)
         msg = msg+'\n'+msg2
-    msg+='WOULD have saved to db'
-    #mongo_client.txns.insert_many(txns)
-    return([msg, txns, unmatched])
 
-def import_gemini(attachment: discord.Attachment, userid: str):
+    logger.info(f'WOULD have saved {len(txns)} txns')
+    # mongo_client.txns.insert_many(txns)
+    return(msg, txns, unmatched)
+
+def import_gemini(attachment: discord.File, userid: str):
     '''gemini transaction_history as of March 2024'''
-    logger.info(attachment._filename)
     gemini = pd.read_excel(attachment)
     gemini['ddate'] = pd.to_datetime(gemini.Date)
     gemini.set_index(gemini.ddate, inplace=True)
+    gemini.dropna(subset=['Type'],inplace=True) #remove summary row with current account status; it is not a txn
     # gd = gemini.filter(like="Amount") \
     #     .apply(lambda row: {'ddate': row.name, **{col: val for col, val in row.items() if pd.notna(val)}}, axis=1) \
     #     .tolist()
@@ -379,8 +400,9 @@ def import_gemini(attachment: discord.Attachment, userid: str):
         t['currency'] = match_coin(t.get('currency'))
 
     unmatched = None
-    mongo_client.txns.insert_many(txns)
-    return([msg,txns,unmatched])
+    logger.info(f'WOULD have saved {len(txns)} txns')
+    # mongo_client.txns.insert_many(txns)
+    return(msg,txns,unmatched)
 
 #endregion
 
@@ -389,6 +411,7 @@ class Scheduler(commands.Cog):
     Scheduler's main job is to call data responsibly, 
     within CoinGecko's public API rate limit of _30 calls/min_ (Feb 2024)
     https://www.coingecko.com/api/documentation
+    Demo plan restricts to _10k calls/mo_ (Mar 2025) == 13 calls/hour
     '''
     def __init__(self, bot):
         self.index = 0
@@ -398,11 +421,15 @@ class Scheduler(commands.Cog):
         self.refresh_coinlist.start()
         self.update_coinvals.start()
         self.refresh_coinbase.start()
+        self.refresh_gemini.start()
         logging.debug('Scheduler loaded')
 
     def cog_unload(self):
         self.update_coinvals.stop()
         self.refresh_coinlist.stop()
+        self.refresh_coinbase.stop()
+        self.refresh_gemini.stop()
+        self.cleanup.stop()
 
     # @tasks.loop(hours=24)
     # async def check_users(self):
@@ -448,11 +475,70 @@ class Scheduler(commands.Cog):
                             {url2}:{r2.status_code}'''
             )
 
-    @tasks.loop(minutes=5)
+    @tasks.loop(hours=24)
+    async def refresh_gemini():
+        '''check gemini for new coins.
+        sandbox_url = https://api.sandbox.gemini.com/v1/ and 
+        url = https://api.gemini.com/v1/symbols are both less ueful/complete than the default homepage
+        '''
+
+        url1 = 'https://exchange.gemini.com/alldetails/1m?skip=6'
+        r1 = requests.get(url1)
+            # response.json().keys() =
+            # dict_keys(['symbol', 'from', 'to', 'fromDisplayName', 'toDisplayName', '24hrMin', '24hrMax', \
+            #  '24hrDelta', '24hrPercentDelta', 'rangeDelta', 'rangePercentDelta', 'range', 'bid', \
+            # 'ask', 'marketCap', 'supply', 'allTimeHigh', 'volume', 'instantMarketOpen', 'limitOrderOpen', \
+            # 'stopLimitOrderOpen', 'priceInputDecimals', 'isSyntheticPair', 'isPerpPair', 'lastTradePrice'])
+
+        url2 = 'https://mobile.gemini.com/mobile/market'
+        r2 = requests.get(url2)
+            #assets = response.json().get('assets')
+            # assets.keys() = # dict_keys(
+            # ['symbol', 'from', 'to', 'fromDisplayName', 'toDisplayName', '24hrMin', '24hrMax', \
+            #  '24hrDelta', '24hrPercentDelta', 'rangeDelta', 'rangePercentDelta', 'range', 'bid', \
+            #  'ask', 'marketCap', 'supply', 'allTimeHigh', 'volume', 'instantMarketOpen', 'limitOrderOpen', \
+            # 'stopLimitOrderOpen', 'priceInputDecimals', 'isSyntheticPair', 'isPerpPair', 'lastTradePrice'])
+
+        if r1.status_code == 200 and r2.status_code == 200:
+            # exchange market should be FROM usd TO crypto
+            # mobile market should be FROM crypto TO usd
+            exchange_from = [{'from':x.get('from'),'fromDisplayName':x.get('fromDisplayName')} for x in r1.json()]
+            exchange_to = [{'to':x.get('to'),'toDisplayName':x.get('toDisplayName')} for x in r1.json()]
+            mobile_market_from = [{'from':x.get('from'),'fromDisplayName':x.get('fromDisplayName')} for x in r2.json().get('assets')]
+            mobile_market_to = [{'to':x.get('to'),'toDisplayName':x.get('toDisplayName')} for x in r2.json().get('assets')]
+            # this ... shouldn't? happen
+            if len(list(set([x.get('from') for x in exchange_from]))) != len(exchange_from):
+                logger.warning(f'duplicate gemini data found in {url1} from')
+                return
+            elif len(list(set([x.get('to') for x in exchange_to]))) != len(exchange_to):
+                logger.warning(f'duplicate gemini data found in {url1} to')
+                return
+            elif len(list(set([x.get('from') for x in mobile_market_from]))) != len(mobile_market_from):
+                logger.warning(f'duplicate gemini data found in {url2} from')
+                return
+            elif len(list(set([x.get('to') for x in mobile_market_to]))) != len(mobile_market_to):
+                logger.warning(f'duplicate gemini data found in {url2} to')
+                return
+            combined_lists = sum([exchange_from,exchange_to,mobile_market_from,mobile_market_to])
+            gemini_coins = list(set(frozenset(x.items()) for x in combined_lists))
+            # fix keys - to/toDisplayName and from/fromDisplayName
+            normalized_coins = [{'symbol':x.get('to') or x.get('from'), 'name':x.get('toDisplayName') or x.get('fromDisplayName')} for x in gemini_coins]
+            # remove duplicates 
+            frozen_normalized = list(set(frozenset(normalized_coins)))
+            # back to dict for mongodb
+            gemini = [dict(x) for x in frozen_normalized]
+            mongo_client.gemini.delete_many({})
+            mongo_client.gemini.insert_many(gemini_coins)
+        else:
+            logger.warning(f'''Failed to refresh discoin.gemini \n
+                           {url1}:{r1.status_code} \n
+                            {url2}:{r2.status_code}''')
+
+    @tasks.loop(minutes=60)
     async def update_coinvals(self, vs=['usd']):
         '''
         replaces coin_latest collection with up-to-date data from /simple/price.
-        updated every 5 min.
+        updated every 60 min.
         '''
         coins = list(set([x.get('currency') for x in mongo_client.txns.find()]))
         base = 'https://api.coingecko.com/api/v3/simple/price'
@@ -807,12 +893,10 @@ async def _importfile(ixn: discord.Interaction, source: Literal['coinbase', 'gem
     '''import txns from coinbase or gemini.'''
     await ixn.response.defer(ephemeral=True, thinking=True)
     ffile = await file.to_file(filename=f'import-{file.filename}')
-    sfile = await file.save(f'import-{file.filename}')
-    rfile = await file.read()
     if source == 'coinbase':
-        [msg, txns, unmatched] = import_coinbase(attachment=ffile.fp, userid=str(ixn.user.id))
+        msg, txns, unmatched = import_coinbase(attachment=ffile.fp, userid=str(ixn.user.id))
     elif source == 'gemini':
-        [msg, txns, unmatched] = import_gemini(attachment=ffile.fp, userid=str(ixn.user.id))
+        msg, txns, unmatched = import_gemini(attachment=ffile.fp, userid=str(ixn.user.id))
     
     if not unmatched.empty:
         export_filename = f'export-{ixn.user.id}-{dt.datetime.now().strftime("%Y%m%d-%H%m")}.csv'
